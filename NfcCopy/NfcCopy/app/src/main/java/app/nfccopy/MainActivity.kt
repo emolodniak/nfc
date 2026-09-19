@@ -50,6 +50,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBarsPadding
@@ -176,6 +177,7 @@ sealed interface Ui {
 
 class Model(private val prefs: SharedPreferences) {
     var ui by mutableStateOf<Ui>(Ui.Idle)
+    var step by mutableStateOf("")
     val saved = mutableStateListOf<Dump>()
 
     init {
@@ -278,14 +280,24 @@ object KeyVault {
     }
 }
 
-private fun analyse(tag: Tag): Dump {
+/** Rolling debug log for the current/last operation. In-memory only, cleared at the start of each read/write. */
+object DebugLog {
+    val lines = mutableStateListOf<String>()
+    private var t0 = 0L
+    fun start(op: String) { lines.clear(); t0 = SystemClock.elapsedRealtime(); add(op) }
+    fun add(s: String) { lines.add("+%4dms  %s".format(SystemClock.elapsedRealtime() - t0, s)) }
+    fun text() = lines.joinToString("\n")
+}
+
+private fun analyse(tag: Tag, step: (String) -> Unit): Dump {
     val uid = tag.id
     return try {
-        MifareClassic.get(tag)?.let { readClassic(it, uid) }
+        MifareClassic.get(tag)?.let { readClassic(it, uid, step) }
             ?: MifareUltralight.get(tag)?.let { readUl(it, uid) }
             ?: Ndef.get(tag)?.let { readNdef(it, uid) }
             ?: other(tag, uid)
     } catch (e: Exception) {
+        DebugLog.add("read crashed: ${e.message}")
         Dump(uid, "Unknown tag", Kind.INFO, Verdict.NONE, notes = listOf("!Read failed. Hold the tag steady against the phone and try again."))
     }
 }
@@ -399,10 +411,11 @@ private fun MifareClassic.unlock(s: Int, first: ByteArray?, deadline: Long): Pai
     return null
 }
 
-private fun readClassic(m: MifareClassic, uid: ByteArray): Dump {
+private fun readClassic(m: MifareClassic, uid: ByteArray, step: (String) -> Unit): Dump {
     m.connect()
     try {
         val ns = m.sectorCount
+        step("MIFARE Classic detected — $ns sectors. Hold steady, don't lift the tag.")
         val mem = MutableList<ByteArray?>(m.blockCount) { null }
         val keys = MutableList<Pair<ByteArray?, ByteArray?>>(ns) { null to null }
         var last: ByteArray? = null
@@ -410,12 +423,25 @@ private fun readClassic(m: MifareClassic, uid: ByteArray): Dump {
         val deadline = SystemClock.elapsedRealtime() + 12_000
         var timedOut = false
         for (s in 0 until ns) {
+            step("Reading sector $s of ${ns - 1}…")
             val hit = m.unlock(s, last, deadline)
-            if (hit == null) { if (SystemClock.elapsedRealtime() > deadline) timedOut = true; continue }
+            if (hit == null) {
+                DebugLog.add("sector $s: no matching key" + if (SystemClock.elapsedRealtime() > deadline) " (time budget used up)" else "")
+                if (SystemClock.elapsedRealtime() > deadline) timedOut = true
+                continue
+            }
             last = hit.first
             KeyVault.learn(hit.first)
+            DebugLog.add("sector $s: key ${hit.first.hex()} (key ${if (hit.second) "B" else "A"})")
             val first = secStart(s); val len = secLen(s)
-            for (b in first until first + len) mem[b] = try { m.readBlock(b) } catch (e: IOException) { null }
+            // A block read can drop transiently (tag shifted slightly); retry twice before giving up on it.
+            for (b in first until first + len) {
+                var v: ByteArray? = null
+                repeat(3) { if (v == null) v = try { m.readBlock(b) } catch (e: IOException) { reconnect(m); m.unlock(s, hit.first, deadline); null } }
+                mem[b] = v
+            }
+            val bad = (first until first + len).count { mem[it] == null }
+            if (bad > 0) DebugLog.add("sector $s: $bad block(s) unreadable after retries")
             val tr = mem[first + len - 1]
             var ka: ByteArray? = if (!hit.second) hit.first else null
             var kb: ByteArray? = if (hit.second) hit.first else tr?.copyOfRange(10, 16)?.takeIf { x -> x.any { it != 0.toByte() } }
@@ -438,6 +464,7 @@ private fun readClassic(m: MifareClassic, uid: ByteArray): Dump {
         if (hidden > 0) warn += "!$hidden sector(s) have hidden keys. Their data is copied, their keys aren't."
         info += "The UID only changes on a 'magic' card (Gen2/CUID). Regular cards keep their own UID."
         info += "Tried ${KeyVault.keys.size} keys from the dictionary."
+        DebugLog.add("read done: $open/$ns sectors opened")
 
         val v = when { open == 0 -> Verdict.NONE; open < ns -> Verdict.PARTIAL; else -> Verdict.FULL }
         val kb = if (m.size >= 1024) "${m.size / 1024} KB" else "${m.size} B"
@@ -499,28 +526,30 @@ private fun other(tag: Tag, uid: ByteArray): Dump {
 
 // ───────────────────────────── NFC: writing ─────────────────────────────
 
-private fun writeTo(tag: Tag, d: Dump): Outcome = try {
+private fun writeTo(tag: Tag, d: Dump, step: (String) -> Unit): Outcome = try {
     when (d.kind) {
-        Kind.ULTRALIGHT -> MifareUltralight.get(tag)?.let { writeUl(it, d) }
+        Kind.ULTRALIGHT -> MifareUltralight.get(tag)?.let { writeUl(it, d, step) }
             ?: d.ndef?.let { b ->
                 writeNdef(tag, b).let { o ->
                     if (o.level == 0) Outcome(1, "Content copied", "Different chip type. Only the NDEF content was copied.") else o
                 }
             }
             ?: Outcome(2, "Wrong target", "Use an NTAG or Ultralight tag as the target.")
-        Kind.CLASSIC -> MifareClassic.get(tag)?.let { writeClassic(it, d) }
+        Kind.CLASSIC -> MifareClassic.get(tag)?.let { writeClassic(it, d, step) }
             ?: Outcome(2, "Wrong target", "Use a MIFARE Classic card as the target.")
         Kind.NDEF -> d.ndef?.let { writeNdef(tag, it) } ?: Outcome(2, "Nothing to write", "This tag has no content.")
         Kind.INFO -> Outcome(2, "Nothing to write", "This tag has no content.")
     }
 } catch (e: Exception) {
+    DebugLog.add("write crashed: ${e.message}")
     Outcome(2, "Tag lost", "Hold the tag steady against the phone and try again.")
 }
 
-private fun writeUl(t: MifareUltralight, d: Dump): Outcome {
+private fun writeUl(t: MifareUltralight, d: Dump, step: (String) -> Unit): Outcome {
     t.connect()
     try {
         val l = ulLayout(t)
+        step("Writing to ${l.name}. Don't move the tag until this finishes.")
         var last = 4
         for (p in 4..d.userEnd) if (d.mem[p]?.any { it != 0.toByte() } == true) last = p
         if (last > l.userEnd)
@@ -531,14 +560,14 @@ private fun writeUl(t: MifareUltralight, d: Dump): Outcome {
         for (p in 4..last) {
             val data = d.mem[p]
             if (data == null) { missing++; continue }
-            try { t.writePage(p, data); written++ } catch (e: IOException) {
-                rejected++; reconnect(t)
-                if (written == 0 && rejected >= 2) break
-            }
+            step("Writing page $p of $last…")
+            var ok = false
+            repeat(3) { if (!ok) { try { t.writePage(p, data); ok = true } catch (e: IOException) { reconnect(t) } } }
+            if (ok) written++ else { rejected++; DebugLog.add("page $p rejected after retries") }
+            if (written == 0 && rejected >= 2) return Outcome(2, "Write failed", "The tag rejected every write. It is locked or password-protected. Try a blank tag.")
         }
-        if (written == 0)
-            return Outcome(2, "Write failed", "The tag rejected every write. It is locked or password-protected. Try a blank tag.")
 
+        step("Verifying…")
         var mismatch = 0
         var p = 4
         while (p <= last) {
@@ -549,6 +578,7 @@ private fun writeUl(t: MifareUltralight, d: Dump): Outcome {
             }
             p += 4
         }
+        DebugLog.add("write done: $written written, $rejected rejected, $mismatch failed verification")
         return if (rejected == 0 && missing == 0 && mismatch == 0)
             Outcome(0, "Cloned", "${l.name}: ${last - 3} pages written and verified. The UID can't be copied.")
         else
@@ -558,27 +588,37 @@ private fun writeUl(t: MifareUltralight, d: Dump): Outcome {
     }
 }
 
-private fun writeClassic(t: MifareClassic, d: Dump): Outcome {
+private fun writeClassic(t: MifareClassic, d: Dump, step: (String) -> Unit): Outcome {
     t.connect()
     try {
         if (t.blockCount < d.mem.size)
             return Outcome(2, "Target too small", "The source has ${d.mem.size} blocks, this card only ${t.blockCount}.")
         val ns = secCount(d.mem.size)
+        step("Writing $ns sectors. Don't move the tag until this finishes.")
         var okSectors = 0; var uidCopied = false; var keysSkipped = 0
+        val failedSectors = mutableListOf<Int>()
         var key: Pair<ByteArray, Boolean>? = null
         val deadline = SystemClock.elapsedRealtime() + 12_000
 
-        fun write(s: Int, b: Int, data: ByteArray): Boolean = try {
-            t.writeBlock(b, data); true
-        } catch (e: IOException) {
-            reconnect(t); key = t.unlock(s, key?.first, deadline); false
+        // A block write can drop transiently (tag shifted slightly). Retry a few times, reconnecting
+        // and re-authenticating in between, before treating the sector as genuinely failed.
+        fun write(s: Int, b: Int, data: ByteArray): Boolean {
+            repeat(3) { attempt ->
+                try { t.writeBlock(b, data); return true }
+                catch (e: IOException) {
+                    DebugLog.add("sector $s block $b: write failed, retry ${attempt + 1}")
+                    reconnect(t); key = t.unlock(s, key?.first, deadline)
+                }
+            }
+            return false
         }
 
         for (s in 0 until ns) {
             val first = secStart(s); val len = secLen(s)
             val src = d.mem.subList(first, first + len)
             if (src.all { it == null }) continue
-            key = t.unlock(s, key?.first, deadline) ?: continue
+            step("Writing sector $s of ${ns - 1}…")
+            key = t.unlock(s, key?.first, deadline) ?: run { DebugLog.add("sector $s: auth failed, skipped"); failedSectors += s; continue }
             var bad = 0
             // Block 0 (UID) only succeeds on "magic" cards; a normal card just refuses it.
             if (s == 0) src[0]?.let { if (write(0, 0, it)) uidCopied = true }
@@ -586,12 +626,22 @@ private fun writeClassic(t: MifareClassic, d: Dump): Outcome {
             val (ka, kb) = d.keys.getOrNull(s) ?: (null to null)
             val tr = src[len - 1]
             if (tr != null && ka != null && kb != null) { if (!write(s, first + len - 1, tr)) bad++ } else keysSkipped++
-            if (bad == 0) okSectors++
+            if (bad == 0) okSectors++ else { failedSectors += s; DebugLog.add("sector $s: $bad block(s) failed after retries") }
         }
+        DebugLog.add("write done: $okSectors/$ns sectors")
 
-        val detail = "$okSectors of $ns sectors written. " +
-            (if (uidCopied) "UID copied (magic card)." else "UID unchanged.") +
-            (if (keysSkipped > 0) " Keys of $keysSkipped sector(s) weren't copied." else "")
+        val detail = buildString {
+            append("$okSectors of $ns sectors written. ")
+            append(if (uidCopied) "UID copied (magic card). " else "UID unchanged. ")
+            if (keysSkipped > 0) append("Keys of $keysSkipped sector(s) weren't copied. ")
+            if (failedSectors.isNotEmpty()) {
+                append("Sector(s) ${failedSectors.joinToString(", ")} didn't write. ")
+                append(
+                    if (0 in failedSectors) "Sector 0 holds the UID and manufacturer data — some readers check it, so test the tag on the actual door before trusting this copy."
+                    else "Most access cards only use 1–2 sectors for the actual door credential; the rest are blank. Test on the real reader — it will very likely still work if the sector(s) it checks came through."
+                )
+            }
+        }
         return when {
             okSectors == 0 -> Outcome(2, "Write failed", "The card is locked or uses unknown keys. Use a blank card.")
             okSectors == ns && keysSkipped == 0 -> Outcome(0, "Cloned", detail)
@@ -657,12 +707,16 @@ class MainActivity : ComponentActivity() {
         if (m.ui is Ui.Busy) return
         val t0 = SystemClock.elapsedRealtime()
         val armed = (m.ui as? Ui.Armed)?.dump
+        val step: (String) -> Unit = { s -> m.step = s; DebugLog.add(s) }
+        m.step = ""
         m.ui = Ui.Busy(if (armed != null) "Writing…" else "Reading…")
         if (armed != null) {
-            val o = writeTo(tag, armed)
+            DebugLog.start("WRITE ${armed.type} → target")
+            val o = writeTo(tag, armed, step)
             settle(t0); m.ui = Ui.Done(o, armed)
         } else {
-            val d = analyse(tag)
+            DebugLog.start("READ")
+            val d = analyse(tag, step)
             settle(t0); m.remember(d); m.ui = Ui.Result(d)
         }
     }
@@ -723,6 +777,10 @@ fun App(
                         Spinner(96.dp)
                         Spacer(Modifier.height(28.dp))
                         Text(ui.label, color = Ink, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
+                        Spacer(Modifier.height(10.dp))
+                        AnimatedContent(m.step, transitionSpec = { fadeIn(tween(150)) togetherWith fadeOut(tween(100)) }, label = "step") { s ->
+                            Text(s.ifEmpty { "Keep the tag against the phone…" }, color = Sub, fontSize = 14.sp, textAlign = TextAlign.Center, modifier = Modifier.padding(horizontal = 24.dp))
+                        }
                     }
                     is Ui.Result -> ResultView(ui.dump, m, onOpen, onCopy)
                     is Ui.Armed -> Centered {
@@ -732,10 +790,16 @@ fun App(
                         Spacer(Modifier.height(6.dp))
                         Text("Cloning ${ui.dump.type}", color = Sub, fontSize = 15.sp)
                         Text(ui.dump.uid.hex(":"), color = Sub, fontSize = 13.sp)
-                        Spacer(Modifier.height(40.dp))
+                        Spacer(Modifier.height(16.dp))
+                        Text(
+                            "Once it starts, don't lift or shift the tag until it's done — moving it mid-write is the main cause of a partial copy.",
+                            color = Sub, fontSize = 13.sp, textAlign = TextAlign.Center, lineHeight = 18.sp,
+                            modifier = Modifier.padding(horizontal = 32.dp),
+                        )
+                        Spacer(Modifier.height(32.dp))
                         Btn("Cancel", false) { m.ui = Ui.Result(ui.dump) }
                     }
-                    is Ui.Done -> DoneView(ui, m)
+                    is Ui.Done -> DoneView(ui, m, onCopy)
                 }
             }
         }
@@ -840,7 +904,12 @@ private fun ResultView(d: Dump, m: Model, onOpen: (String) -> Unit, onCopy: (Str
     Column(Modifier.fillMaxSize()) {
         Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
             TextButton(onClick = { m.ui = Ui.Idle }) { Text("Close", color = Sub) }
-            if (d in m.saved) TextButton(onClick = { m.delete(d); m.ui = Ui.Idle }) { Text("Delete", color = Bad) }
+            Row {
+                var showLog by remember { mutableStateOf(false) }
+                if (DebugLog.lines.isNotEmpty()) TextButton(onClick = { showLog = true }) { Text("Debug log", color = Sub) }
+                if (showLog) DebugLogDialog(onCopy) { showLog = false }
+                if (d in m.saved) TextButton(onClick = { m.delete(d); m.ui = Ui.Idle }) { Text("Delete", color = Bad) }
+            }
         }
         Column(Modifier.weight(1f).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             VerdictCard(d.verdict)
@@ -880,6 +949,26 @@ private fun ResultView(d: Dump, m: Model, onOpen: (String) -> Unit, onCopy: (Str
             }
         }
     }
+}
+
+@Composable
+private fun DebugLogDialog(onCopy: (String) -> Unit, onClose: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("Debug log", fontWeight = FontWeight.Bold) },
+        text = {
+            Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState())) {
+                Text(
+                    "Every step of the last read/write, with timing. Useful if something looks wrong and you want to see exactly what happened.",
+                    color = Sub, fontSize = 12.sp,
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(DebugLog.text(), color = Ink, fontSize = 12.sp, lineHeight = 17.sp)
+            }
+        },
+        confirmButton = { TextButton(onClick = { onCopy(DebugLog.text()) }) { Text("Copy", color = Brand, fontWeight = FontWeight.SemiBold) } },
+        dismissButton = { TextButton(onClick = onClose) { Text("Close", color = Sub) } },
+    )
 }
 
 @Composable
@@ -931,16 +1020,17 @@ private fun VerdictCard(v: Verdict) {
 }
 
 @Composable
-private fun DoneView(ui: Ui.Done, m: Model) {
+private fun DoneView(ui: Ui.Done, m: Model, onCopy: (String) -> Unit) {
     val o = ui.out
     val c = when (o.level) { 0 -> Good; 1 -> Warn; else -> Bad }
+    var showLog by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
         Badge(c, o.level, 104.dp)
         Spacer(Modifier.height(28.dp))
         Text(o.title, color = Ink, fontSize = 24.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
         Spacer(Modifier.height(8.dp))
-        Text(o.detail, color = Sub, fontSize = 15.sp, lineHeight = 21.sp, textAlign = TextAlign.Center)
-        Spacer(Modifier.height(40.dp))
+        Text(o.detail, color = Sub, fontSize = 15.sp, lineHeight = 21.sp, textAlign = TextAlign.Center, modifier = Modifier.padding(horizontal = 20.dp))
+        Spacer(Modifier.height(28.dp))
         if (o.level == 0) {
             Btn("Done", true) { m.ui = Ui.Idle }
             Spacer(Modifier.height(10.dp))
@@ -949,6 +1039,11 @@ private fun DoneView(ui: Ui.Done, m: Model) {
             Btn("Try again", true) { m.ui = Ui.Armed(ui.dump) }
             Spacer(Modifier.height(10.dp))
             Btn("Close", false) { m.ui = Ui.Result(ui.dump) }
+        }
+        if (DebugLog.lines.isNotEmpty()) {
+            Spacer(Modifier.height(6.dp))
+            TextButton(onClick = { showLog = true }) { Text("View debug log", color = Sub) }
+            if (showLog) DebugLogDialog(onCopy) { showLog = false }
         }
     }
 }
