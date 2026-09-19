@@ -384,7 +384,8 @@ private fun secLen(s: Int) = if (s < 32) 4 else 16
 private fun secCount(blocks: Int) = when { blocks <= 20 -> 5; blocks <= 64 -> 16; blocks <= 128 -> 32; else -> 40 }
 
 private fun MifareClassic.tryAuth(s: Int, k: ByteArray, b: Boolean) =
-    try { if (b) authenticateSectorWithKeyB(s, k) else authenticateSectorWithKeyA(s, k) } catch (e: IOException) { false }
+    try { if (b) authenticateSectorWithKeyB(s, k) else authenticateSectorWithKeyA(s, k) }
+    catch (e: IOException) { reconnect(this); false }
 
 /** Unlocks sector [s] with the first working key ([first] tried unconditionally, then the vault until [deadline]). */
 private fun MifareClassic.unlock(s: Int, first: ByteArray?, deadline: Long): Pair<ByteArray, Boolean>? {
@@ -436,6 +437,7 @@ private fun readClassic(m: MifareClassic, uid: ByteArray): Dump {
         if (timedOut) warn += "!Stopped the key search early to stay fast. Add the tag's key manually to unlock the rest."
         if (hidden > 0) warn += "!$hidden sector(s) have hidden keys. Their data is copied, their keys aren't."
         info += "The UID only changes on a 'magic' card (Gen2/CUID). Regular cards keep their own UID."
+        info += "Tried ${KeyVault.keys.size} keys from the dictionary."
 
         val v = when { open == 0 -> Verdict.NONE; open < ns -> Verdict.PARTIAL; else -> Verdict.FULL }
         val kb = if (m.size >= 1024) "${m.size / 1024} KB" else "${m.size} B"
