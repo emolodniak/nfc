@@ -913,7 +913,8 @@ private fun AddKeyDialog(onClose: () -> Unit) {
     )
 }
 
-
+@Composable
+private fun VerdictCard(v: Verdict) {
     val c = v.color()
     Row(
         Modifier.fillMaxWidth().clip(RoundedCornerShape(24.dp)).background(c.copy(alpha = 0.10f)).padding(20.dp),
