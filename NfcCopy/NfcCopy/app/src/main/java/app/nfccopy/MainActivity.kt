@@ -63,6 +63,9 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -231,11 +234,49 @@ private fun ndefSummary(b: ByteArray?): Pair<String, Boolean>? {
 
 // ───────────────────────────── NFC: reading ─────────────────────────────
 
-private val KEYS = listOf(
-    "FFFFFFFFFFFF", "A0A1A2A3A4A5", "D3F7D3F7D3F7", "000000000000", "B0B1B2B3B4B5",
-    "4D3A99C351DD", "1A982C7E459A", "AABBCCDDEEFF", "714C5C886E97", "587EE5F9350F",
-    "A0478CC39091", "533CB6C723F6", "8FD0A4F256E9",
-).map { it.unhex() }
+/**
+ * Growing key dictionary: ships with common default keys, plus any key the user pastes in
+ * (e.g. from MCT) or that the app itself discovers while reading a tag. Persisted, so a key
+ * learned once (say, a building's door-lock key) is tried automatically on every tag after.
+ */
+/**
+ * Growing key dictionary: ships with ~600 public default/common keys (compiled from mfoc,
+ * Proxmark3/RfidResearchGroup, and other published sources — see assets/keys.txt), plus any
+ * key the user pastes in (e.g. from MCT) or that the app itself discovers while reading a tag.
+ * Discovered/pasted keys are persisted, so a key learned once (say, a building's door-lock key)
+ * is tried automatically on every tag after.
+ */
+object KeyVault {
+    private const val PREF = "keys"
+    private lateinit var prefs: SharedPreferences
+    val keys = mutableStateListOf<ByteArray>()
+
+    fun init(p: SharedPreferences, assets: android.content.res.AssetManager) {
+        prefs = p
+        val bundled = try {
+            assets.open("keys.txt").bufferedReader().useLines { it.map { l -> l.trim() }.filter { l -> l.length == 12 }.toList() }
+        } catch (e: IOException) { emptyList() }
+        val custom = prefs.getStringSet(PREF, emptySet()) ?: emptySet()
+        keys.clear()
+        keys.addAll((bundled + custom).distinct().map { it.unhex() })
+    }
+
+    /** Remembers a key that worked, so future tags try it too. No-op if already known. */
+    fun learn(k: ByteArray) {
+        if (keys.any { it.contentEquals(k) }) return
+        keys.add(0, k)
+        prefs.edit().putStringSet(PREF, prefs.getStringSet(PREF, emptySet())!!.plus(k.hex())).apply()
+    }
+
+    /** User-entered key, from pasted text (hex, with or without separators). Returns how many were added. */
+    fun addManual(text: String): Int {
+        val found = Regex("[0-9A-Fa-f]{12}").findAll(text.replace(Regex("[:\\-\\s]"), "")).map { it.value.uppercase() }.toList()
+        var added = 0
+        for (h in found) if (keys.none { it.contentEquals(h.unhex()) }) { keys.add(0, h.unhex()); added++ }
+        if (added > 0) prefs.edit().putStringSet(PREF, prefs.getStringSet(PREF, emptySet())!!.plus(found)).apply()
+        return added
+    }
+}
 
 private fun analyse(tag: Tag): Dump {
     val uid = tag.id
@@ -345,10 +386,12 @@ private fun secCount(blocks: Int) = when { blocks <= 20 -> 5; blocks <= 64 -> 16
 private fun MifareClassic.tryAuth(s: Int, k: ByteArray, b: Boolean) =
     try { if (b) authenticateSectorWithKeyB(s, k) else authenticateSectorWithKeyA(s, k) } catch (e: IOException) { false }
 
-/** Unlocks sector [s] with the first working key (trying [first] before the common list). */
-private fun MifareClassic.unlock(s: Int, first: ByteArray?): Pair<ByteArray, Boolean>? {
-    val list = if (first == null) KEYS else listOf(first) + KEYS.filterNot { it.contentEquals(first) }
-    for (k in list) {
+/** Unlocks sector [s] with the first working key ([first] tried unconditionally, then the vault until [deadline]). */
+private fun MifareClassic.unlock(s: Int, first: ByteArray?, deadline: Long): Pair<ByteArray, Boolean>? {
+    first?.let { if (tryAuth(s, it, false)) return it to false; if (tryAuth(s, it, true)) return it to true }
+    for (k in KeyVault.keys) {
+        if (first != null && k.contentEquals(first)) continue
+        if (SystemClock.elapsedRealtime() > deadline) return null
         if (tryAuth(s, k, false)) return k to false
         if (tryAuth(s, k, true)) return k to true
     }
@@ -363,16 +406,20 @@ private fun readClassic(m: MifareClassic, uid: ByteArray): Dump {
         val keys = MutableList<Pair<ByteArray?, ByteArray?>>(ns) { null to null }
         var last: ByteArray? = null
         var open = 0
+        val deadline = SystemClock.elapsedRealtime() + 12_000
+        var timedOut = false
         for (s in 0 until ns) {
-            val hit = m.unlock(s, last) ?: continue
+            val hit = m.unlock(s, last, deadline)
+            if (hit == null) { if (SystemClock.elapsedRealtime() > deadline) timedOut = true; continue }
             last = hit.first
+            KeyVault.learn(hit.first)
             val first = secStart(s); val len = secLen(s)
             for (b in first until first + len) mem[b] = try { m.readBlock(b) } catch (e: IOException) { null }
             val tr = mem[first + len - 1]
             var ka: ByteArray? = if (!hit.second) hit.first else null
             var kb: ByteArray? = if (hit.second) hit.first else tr?.copyOfRange(10, 16)?.takeIf { x -> x.any { it != 0.toByte() } }
-            if (ka == null) ka = KEYS.firstOrNull { m.tryAuth(s, it, false) }
-            if (kb == null) kb = KEYS.firstOrNull { m.tryAuth(s, it, true) }
+            if (ka == null) ka = KeyVault.keys.firstOrNull { m.tryAuth(s, it, false) }
+            if (kb == null) kb = KeyVault.keys.firstOrNull { m.tryAuth(s, it, true) }
             if (tr != null) { // put the real keys back into the trailer so the dump is complete
                 val t = tr.copyOf()
                 ka?.copyInto(t, 0); kb?.copyInto(t, 10)
@@ -386,6 +433,7 @@ private fun readClassic(m: MifareClassic, uid: ByteArray): Dump {
         val warn = mutableListOf<String>(); val info = mutableListOf<String>()
         if (open == 0) warn += "!No known key opens this card. It uses custom keys, so nothing can be read."
         else if (open < ns) warn += "!${ns - open} of $ns sectors use unknown keys. They can't be read or copied."
+        if (timedOut) warn += "!Stopped the key search early to stay fast. Add the tag's key manually to unlock the rest."
         if (hidden > 0) warn += "!$hidden sector(s) have hidden keys. Their data is copied, their keys aren't."
         info += "The UID only changes on a 'magic' card (Gen2/CUID). Regular cards keep their own UID."
 
@@ -516,18 +564,19 @@ private fun writeClassic(t: MifareClassic, d: Dump): Outcome {
         val ns = secCount(d.mem.size)
         var okSectors = 0; var uidCopied = false; var keysSkipped = 0
         var key: Pair<ByteArray, Boolean>? = null
+        val deadline = SystemClock.elapsedRealtime() + 12_000
 
         fun write(s: Int, b: Int, data: ByteArray): Boolean = try {
             t.writeBlock(b, data); true
         } catch (e: IOException) {
-            reconnect(t); key = t.unlock(s, key?.first); false
+            reconnect(t); key = t.unlock(s, key?.first, deadline); false
         }
 
         for (s in 0 until ns) {
             val first = secStart(s); val len = secLen(s)
             val src = d.mem.subList(first, first + len)
             if (src.all { it == null }) continue
-            key = t.unlock(s, key?.first) ?: continue
+            key = t.unlock(s, key?.first, deadline) ?: continue
             var bad = 0
             // Block 0 (UID) only succeeds on "magic" cards; a normal card just refuses it.
             if (s == 0) src[0]?.let { if (write(0, 0, it)) uidCopied = true }
@@ -584,6 +633,7 @@ class MainActivity : ComponentActivity() {
         val clear = android.graphics.Color.TRANSPARENT
         enableEdgeToEdge(SystemBarStyle.light(clear, clear), SystemBarStyle.light(clear, clear))
         m = Model(getSharedPreferences("nfc", MODE_PRIVATE))
+        KeyVault.init(getSharedPreferences("keys", MODE_PRIVATE), assets)
         setContent { App(m, nfc != null, nfcOn, ::openNfcSettings, ::openUri, ::copyText) }
     }
 
@@ -815,6 +865,13 @@ private fun ResultView(d: Dump, m: Model, onOpen: (String) -> Unit, onCopy: (Str
         Column(Modifier.padding(vertical = 16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             if (d.kind != Kind.INFO && d.verdict != Verdict.NONE && d.verdict != Verdict.BLANK)
                 Btn("Clone to another tag", true) { m.ui = Ui.Armed(d) }
+            if (d.kind == Kind.CLASSIC && d.verdict != Verdict.FULL) {
+                var open by remember { mutableStateOf(false) }
+                TextButton(onClick = { open = true }, modifier = Modifier.fillMaxWidth()) {
+                    Text("Add keys to unlock more sectors", color = Brand, fontWeight = FontWeight.SemiBold)
+                }
+                if (open) AddKeyDialog { open = false }
+            }
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 if (content != null && content.second) Btn("Open", false, Modifier.weight(1f)) { onOpen(content.first) }
                 if (d.kind != Kind.INFO) Btn("Copy", false, Modifier.weight(1f)) { onCopy(d.text()) }
@@ -824,7 +881,37 @@ private fun ResultView(d: Dump, m: Model, onOpen: (String) -> Unit, onCopy: (Str
 }
 
 @Composable
-private fun VerdictCard(v: Verdict) {
+private fun AddKeyDialog(onClose: () -> Unit) {
+    var text by remember { mutableStateOf("") }
+    var msg by remember { mutableStateOf<String?>(null) }
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("Add keys", fontWeight = FontWeight.Bold) },
+        text = {
+            Column {
+                Text("Paste key(s) copied from another tool (12 hex characters each, one per line).", color = Sub, fontSize = 13.sp)
+                Spacer(Modifier.height(10.dp))
+                OutlinedTextField(
+                    value = text, onValueChange = { text = it; msg = null },
+                    placeholder = { Text("8829DA9DAF76") },
+                    modifier = Modifier.fillMaxWidth(),
+                    keyboardOptions = KeyboardOptions(),
+                )
+                msg?.let { Spacer(Modifier.height(8.dp)); Text(it, color = if (it.startsWith("Added")) Good else Bad, fontSize = 13.sp) }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                val n = KeyVault.addManual(text)
+                msg = if (n > 0) "Added $n key(s). Scan the tag again to use them." else "No valid 12-character hex key found."
+                if (n > 0) text = ""
+            }) { Text("Save", color = Brand, fontWeight = FontWeight.SemiBold) }
+        },
+        dismissButton = { TextButton(onClick = onClose) { Text("Close", color = Sub) } },
+    )
+}
+
+
     val c = v.color()
     Row(
         Modifier.fillMaxWidth().clip(RoundedCornerShape(24.dp)).background(c.copy(alpha = 0.10f)).padding(20.dp),
