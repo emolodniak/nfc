@@ -242,8 +242,9 @@ private fun ndefSummary(b: ByteArray?): Pair<String, Boolean>? {
  * learned once (say, a building's door-lock key) is tried automatically on every tag after.
  */
 /**
- * Growing key dictionary: ships with ~600 public default/common keys (compiled from mfoc,
- * Proxmark3/RfidResearchGroup, and other published sources — see assets/keys.txt), plus any
+ * Growing key dictionary: ships with ~1,900 public default/common keys (compiled from mfoc,
+ * Proxmark3/RfidResearchGroup, mfterm, and other published sources — including regional transit
+ * systems, access-control vendors, and hobbyist dumps; see assets/keys.txt), plus any
  * key the user pastes in (e.g. from MCT) or that the app itself discovers while reading a tag.
  * Discovered/pasted keys are persisted, so a key learned once (say, a building's door-lock key)
  * is tried automatically on every tag after.
